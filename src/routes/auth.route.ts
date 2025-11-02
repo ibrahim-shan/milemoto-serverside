@@ -857,7 +857,7 @@ auth.post('/mfa/login/verify', mfaVerifyLimiter, async (req, res, next) => {
         phone: rec.phone,
         role,
       },
-    }as AuthOutputDto);
+    } as AuthOutputDto);
   } catch (e) {
     next(e);
   }
@@ -974,7 +974,7 @@ auth.get('/me', async (req, res) => {
       phone: u.phone,
       role: u.role,
       status: u.status,
-    });
+    } as UserDto);
   } catch {
     return res.status(401).json({ error: 'Invalid token' });
   }
