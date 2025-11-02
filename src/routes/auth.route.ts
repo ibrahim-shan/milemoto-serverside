@@ -34,7 +34,7 @@ import type {
   RefreshResponseDto,
   RegisterResponseDto,
   UserDto,
-} from '';
+} from '@milemoto/types';
 
 interface UserAuthData {
   id: string | number;
