@@ -5,4 +5,3 @@ export const runtimeFlags = {
   // When true, enforce trusted-device fingerprint checks for all users (admins are always enforced)
   trustedDeviceFpEnforceAll: env.TRUSTED_DEVICE_FINGERPRINT_ENABLED,
 };
-

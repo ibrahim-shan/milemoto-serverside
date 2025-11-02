@@ -1,5 +1,5 @@
 import { Router, type Response } from 'express';
-import { auth } from './auth.route.js';
+import { auth } from './auth/index.js';
 import { health } from './health.route.js';
 import { uploads } from './uploads.route.js';
 import { admin } from './admin.route.js';

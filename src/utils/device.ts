@@ -1,4 +1,4 @@
-function ipPrefix(ipRaw: string | null | undefined): string {
+export function ipPrefix(ipRaw: string | null | undefined): string {
   const ip = (ipRaw || '').trim();
   if (!ip) return 'unknown';
   if (ip === '::1' || ip === '127.0.0.1') return 'local';

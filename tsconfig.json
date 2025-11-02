@@ -4,7 +4,6 @@
     "module": "ES2022",
     "moduleResolution": "Bundler",
     "outDir": "dist",
-    "rootDir": "src",
     "strict": true,
     "esModuleInterop": true,
     "forceConsistentCasingInFileNames": true,
@@ -12,7 +11,12 @@
     "baseUrl": ".",
     "paths": {
       "@milemoto/types": ["../packages/types/src"]
-    }
+    },
+    "rootDirs": [
+      "src",
+      "../packages/types/src" 
+    ]
   },
-  "include": ["src"]
+  "include": ["src"],
+  "exclude": ["node_modules", "dist"]
 }
