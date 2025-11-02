@@ -1,0 +1,72 @@
+@base = http://localhost:4000
+@seed = {{$timestamp}}
+@userEmail = test-{{seed}}@example.com
+@password = Secret1234!
+
+### Health
+GET {{base}}/api/health
+
+### Register
+POST {{base}}/api/auth/register
+Content-Type: application/json
+
+{
+  "fullName": "Test User {{seed}}",
+  "email": "{{userEmail}}",
+  "phone": "+96176760016",
+  "password": "{{password}}"
+}
+
+### Login  (copy accessToken from response)
+POST {{base}}/api/auth/login
+Content-Type: application/json
+
+{
+  "email": "{{userEmail}}",
+  "password": "{{password}}"
+}
+
+### Me  (paste your token below from Login response)
+@accessToken = eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIzIiwicm9sZSI6InVzZXIiLCJpYXQiOjE3NjE4MjI2MzEsImV4cCI6MTc2MTgyMzUzMX0.ycx4i_ZGicMi3g7U4TlDkflfVOUz79qj4aNJUyloLk0
+GET {{base}}/api/auth/me
+Authorization: Bearer {{accessToken}}
+
+### Refresh  (uses cookie set by Register/Login)
+POST {{base}}/api/auth/refresh
+
+### Forgot (dev returns resetUrl)
+POST {{base}}/api/auth/forgot
+Content-Type: application/json
+
+{ "email": "{{userEmail}}" }
+
+### Reset  (paste token from resetUrl query)
+@resetToken = eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxIiwicm9sZSI6InVzZXIiLCJpYXQiOjE3NjE4MjExODUsImV4cCI6MTc2MTgyMjA4NX0.MiBhxgWqzDaziTWmENq3wzrpuyXaMD_nntSCagHODxo
+POST {{base}}/api/auth/reset
+Content-Type: application/json
+
+{ "token": "{{resetToken}}", "password": "NewSecret123!" }
+
+### Get signed upload URL
+POST {{base}}/api/uploads/signed
+Content-Type: application/json
+
+{
+  "filename": "test.webp",
+  "contentType": "image/webp",
+  "folder": "demo"
+}
+
+### Upload file to signed URL
+# 1) Copy the "uploadUrl" from previous response into the variable below.
+@uploadUrl = PASTE_UPLOAD_URL_HERE
+# 2) Put a file at this path relative to your workspace:
+#    ./tests/assets/test.webp
+PUT {{uploadUrl}}
+Content-Type: image/webp
+
+< ./tests/assets/test.webp
+
+### Verify public URL (200 if object/bucket is public; 403 if private)
+@publicUrl = PASTE_PUBLIC_URL_HERE
+HEAD {{publicUrl}}
