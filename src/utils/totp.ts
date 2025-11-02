@@ -106,7 +106,8 @@ export function generateBackupCodes(count = 10) {
     const raw = randomBytes(5).toString('hex').toUpperCase(); // 10 hex chars
     const pretty = `${raw.slice(0, 4)}-${raw.slice(4, 8)}${raw.slice(8)}`; // e.g., ABCD-EF12-3
     codes.push(pretty);
-    const h = createHmac('sha256', 'mm-bc-v1').update(pretty).digest('hex'); // domain-separated hash
+    // Hash with server-configured secret so verification matches disable/verify logic
+    const h = createHmac('sha256', env.BACKUP_CODE_HMAC_SECRET).update(pretty).digest('hex');
     hashes.push(h);
   }
   return { codes, hashes };

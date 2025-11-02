@@ -15,6 +15,7 @@ import {
   generateBackupCodes,
 } from '../utils/totp.js';
 import { env } from '../config/env.js';
+import { runtimeFlags } from '../config/runtime.js';
 import { ulid } from 'ulid';
 import {
   loginByIpLimiter,
@@ -81,6 +82,17 @@ const ChangePassword = z.object({
   newPassword: z.string().min(8).max(128),
 });
 
+const UpdateProfile = z.object({
+  fullName: z.string().min(2).max(191),
+  phone: z.union([z.string().min(7).max(32), z.null()]).optional(),
+});
+
+const DisableMfa = z.object({
+  password: z.string().min(8),
+  code: z.string().min(4).max(64),
+  rememberDevice: z.boolean().optional().default(false), // 6-digit TOTP or backup code
+});
+
 const VerifyEmail = z.object({
   token: z.string().min(32),
 });
@@ -99,6 +111,147 @@ function backupHash(code: string) {
   return crypto.createHmac('sha256', env.BACKUP_CODE_HMAC_SECRET).update(code).digest('hex');
 }
 
+// Trusted device cookie helpers (HMAC signed payload)
+function signTrustedDevice(payload: { sub: string; exp: number }) {
+  const body = Buffer.from(JSON.stringify(payload)).toString('base64url');
+  const sig = crypto.createHmac('sha256', env.OAUTH_STATE_SECRET).update(body).digest('base64url');
+  return `${body}.${sig}`;
+}
+function verifyTrustedDevice(token: string): { sub: string; exp: number } | null {
+  const [body, sig] = token.split('.');
+  if (!body || !sig) return null;
+  const expSig = crypto
+    .createHmac('sha256', env.OAUTH_STATE_SECRET)
+    .update(body)
+    .digest('base64url');
+  const ok =
+    expSig.length === sig.length && crypto.timingSafeEqual(Buffer.from(expSig), Buffer.from(sig));
+  if (!ok) return null;
+  try {
+    const p = JSON.parse(Buffer.from(body, 'base64url').toString('utf8')) as {
+      sub: string;
+      exp: number;
+    };
+    if (typeof p.sub !== 'string' || typeof p.exp !== 'number') return null;
+    return p;
+  } catch {
+    return null;
+  }
+}
+
+// New trusted-device helpers backed by DB
+function ipPrefix(ipRaw: string | null | undefined): string {
+  const ip = (ipRaw || '').trim();
+  if (!ip) return 'unknown';
+  if (ip === '::1' || ip === '127.0.0.1') return 'local';
+  if (ip.includes('.')) {
+    const parts = ip.split('.');
+    return parts.slice(0, 3).join('.') || 'v4';
+  }
+  if (ip.includes(':')) {
+    const parts = ip.split(':').filter(Boolean);
+    return parts.slice(0, 4).join(':') || 'v6';
+  }
+  return 'unknown';
+}
+
+async function validateTrustedCookie(req: any, userId: string, role?: 'user' | 'admin'): Promise<boolean> {
+  try {
+    const raw = String(req.cookies?.mm_trusted || '');
+    if (!raw) return false;
+
+    const [id, token] = raw.split('.');
+    if (id && token) {
+      const [rows] = await pool.query<RowDataPacket[]>(
+        `SELECT id, user_id, token_hash, fingerprint, expires_at, revoked_at FROM trusted_devices WHERE id = ? LIMIT 1`,
+        [id]
+      );
+      const rec = rows[0];
+      if (!rec) return false;
+      if (String(rec.user_id) !== String(userId)) return false;
+      if (rec.revoked_at) return false;
+      if (new Date(rec.expires_at) <= new Date()) return false;
+      if (sha256(token) !== rec.token_hash) return false;
+      // Soft fingerprinting: enforce for admins or if env flag is set
+      const needFp = role === 'admin' || runtimeFlags.trustedDeviceFpEnforceAll;
+      if (needFp && rec.fingerprint) {
+        const ua = req.get('user-agent') || '';
+        const current = sha256(`${ua}|${ipPrefix(req.ip)}`);
+        if (current !== rec.fingerprint) {
+          // Log redacted details for audit
+          try {
+            logger.warn(
+              {
+                code: 'TrustedDeviceFingerprintMismatch',
+                userId: String(userId),
+                deviceId: String(rec.id),
+                role,
+                ipPrefix: ipPrefix(req.ip),
+                uaHash: sha256(ua),
+                storedFp: String(rec.fingerprint).slice(0, 8),
+                currentFp: current.slice(0, 8),
+              },
+              'Trusted device fingerprint mismatch; requiring MFA'
+            );
+          } catch {}
+          return false; // mismatch: require MFA once
+        }
+      }
+      // Update last_used_at asynchronously (no need to await)
+      void pool.query(`UPDATE trusted_devices SET last_used_at = NOW() WHERE id = ?`, [id]);
+      return true;
+    }
+
+    // Backward-compat: support old HMAC cookie format
+    const legacy = verifyTrustedDevice(raw);
+    if (legacy && legacy.sub === String(userId) && legacy.exp > Date.now()) {
+      return true;
+    }
+    return false;
+  } catch (e) {
+    logger.warn({ e, userId }, 'validateTrustedCookie failed');
+    return false;
+  }
+}
+
+async function createTrustedDevice(req: any, res: Response, userId: string) {
+  try {
+    const token = crypto.randomBytes(32).toString('base64url');
+    const tokenHash = sha256(token);
+    const id = ulid();
+    const [row] = await pool.query<RowDataPacket[]>(`SELECT NOW() AS now`);
+    const now = new Date(row[0].now);
+    const exp = new Date(now.getTime() + Number(env.TRUSTED_DEVICE_TTL_DAYS) * 24 * 60 * 60 * 1000);
+    const ua = req.get('user-agent') ?? null;
+    const fp = sha256(`${ua || ''}|${ipPrefix(req.ip)}`);
+    await pool.query(
+      `INSERT INTO trusted_devices (id, user_id, token_hash, fingerprint, user_agent, ip, expires_at, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [id, userId, tokenHash, fp, ua, req.ip ?? null, exp, now]
+    );
+    // Set opaque cookie: id.token
+    res.cookie('mm_trusted', `${id}.${token}`, {
+      httpOnly: true,
+      secure: env.NODE_ENV === 'production',
+      sameSite: 'lax',
+      domain: env.COOKIE_DOMAIN || undefined,
+      expires: exp,
+      path: '/',
+    });
+  } catch (e) {
+    logger.error({ e, userId }, 'Failed to create trusted device');
+  }
+}
+
+
+// Helper: revoke all trusted devices for a user
+async function revokeAllTrustedDevices(userId: string): Promise<void> {
+  try {
+    await pool.query(`UPDATE trusted_devices SET revoked_at = NOW() WHERE user_id = ? AND revoked_at IS NULL`, [userId]);
+  } catch (e) {
+    logger.warn({ e, userId }, 'Failed to revoke trusted devices');
+  }
+}
 function setRefreshCookie(
   res: Response,
   token: string,
@@ -109,7 +262,7 @@ function setRefreshCookie(
     secure: env.NODE_ENV === 'production',
     sameSite: 'lax' as const,
     domain: env.COOKIE_DOMAIN || undefined,
-    path: '/api/auth',
+    path: '/api',
   };
   if (opts.remember) {
     // persistent cookie
@@ -235,8 +388,8 @@ auth.post('/mfa/setup/start', requireAuth, async (req, res, next) => {
       otpauthUrl: uri,
       expiresAt: exp.toISOString(),
     } as MfaSetupStartResponseDto);
-  } catch {
-    return res.status(401).json({ error: 'Invalid token' });
+  } catch (e) {
+    next(e);
   }
 });
 
@@ -260,12 +413,14 @@ auth.post('/mfa/setup/verify', requireAuth, async (req, res, next) => {
       [challengeId, userId]
     );
     const ch = rows[0];
-    if (!ch || ch.consumed_at) return res.status(400).json({ error: 'Invalid challenge' });
+    if (!ch || ch.consumed_at)
+      return res.status(400).json({ code: 'InvalidChallenge', message: 'Invalid challenge' });
     if (new Date(ch.expires_at) < new Date())
-      return res.status(400).json({ error: 'Challenge expired' });
+      return res.status(400).json({ code: 'ChallengeExpired', message: 'Challenge expired' });
 
     const secretRaw = decryptFromBlob(Buffer.from(ch.secret_enc));
-    if (!verifyTotp(code, secretRaw)) return res.status(400).json({ error: 'Invalid code' });
+    if (!verifyTotp(code, secretRaw))
+      return res.status(400).json({ code: 'InvalidCode', message: 'Invalid 6-digit code' });
 
     // persist on user
     await pool.query('UPDATE users SET mfa_secret_enc = ?, mfa_enabled = 1 WHERE id = ?', [
@@ -284,8 +439,69 @@ auth.post('/mfa/setup/verify', requireAuth, async (req, res, next) => {
       );
     }
 
-    // Return plaintext codes ONCE. Client must show/save them.
-    res.json({ ok: true, backupCodes: codes } as MfaSetupVerifyResponseDto);
+    // Return plaintext codes ONCE. Client must show/save them.\n    await revokeAllTrustedDevices(String(userId));\n    res.json({ ok: true, backupCodes: codes } as MfaSetupVerifyResponseDto);
+  } catch (e) {
+    next(e);
+  }
+});
+
+// ===== MFA: disable (requires password + TOTP or backup code) =====
+auth.post('/mfa/disable', requireAuth, async (req, res, next) => {
+  try {
+    if (!req.user) return res.status(401).json({ error: 'Authentication required' });
+    const userId = String(req.user.id);
+    const { password, code } = DisableMfa.parse(req.body);
+
+    const [urows] = await pool.query<RowDataPacket[]>(
+      `SELECT id, password_hash, mfa_enabled, mfa_secret_enc FROM users WHERE id = ? LIMIT 1`,
+      [userId]
+    );
+    const u = urows[0];
+    if (!u) return res.status(404).json({ error: 'User not found' });
+    if (!u.mfa_enabled) return res.status(400).json({ error: 'MFA not enabled' });
+
+    const passOk = await argon2.verify(u.password_hash, password);
+    if (!passOk)
+      return res.status(400).json({ code: 'InvalidPassword', message: 'Invalid password' });
+
+    let ok = false;
+    if (/^\d{6}$/.test(code)) {
+      if (!u.mfa_secret_enc)
+        return res.status(400).json({ code: 'MfaMisconfigured', message: 'MFA misconfigured' });
+      const secretRaw = decryptFromBlob(Buffer.from(u.mfa_secret_enc));
+      ok = verifyTotp(code, secretRaw);
+    }
+    if (!ok) {
+      const rawInput = code.toUpperCase().trim();
+      const pretty =
+        rawInput.length > 4 ? `${rawInput.slice(0, 4)}-${rawInput.slice(4)}` : rawInput;
+      const candidates = [backupHash(rawInput), backupHash(pretty)];
+
+      let bc: RowDataPacket | undefined;
+      for (const h of candidates) {
+        const [brows] = await pool.query<RowDataPacket[]>(
+          `SELECT id FROM mfa_backup_codes WHERE user_id = ? AND code_hash = ? AND used_at IS NULL LIMIT 1`,
+          [userId, h]
+        );
+        if (brows && brows[0]) {
+          bc = brows[0];
+          break;
+        }
+      }
+      if (bc) {
+        ok = true;
+        await pool.query(`UPDATE mfa_backup_codes SET used_at = NOW() WHERE id = ?`, [bc.id]);
+      }
+    }
+    if (!ok)
+      return res.status(400).json({ code: 'InvalidCode', message: 'Invalid 2FA or backup code' });
+
+    await pool.query(`UPDATE users SET mfa_enabled = 0, mfa_secret_enc = NULL WHERE id = ?`, [
+      userId,
+    ]);
+    await pool.query(`DELETE FROM mfa_backup_codes WHERE user_id = ?`, [userId]);
+
+    // Security: Revoke all trusted devices so bypass cannot persist after password change\n    await revokeAllTrustedDevices(String(userId));\n\n    res.json({ ok: true } as OkResponseDto);
   } catch (e) {
     next(e);
   }
@@ -351,10 +567,7 @@ auth.post('/change-password', requireAuth, async (req, res, next) => {
     const newHash = await argon2.hash(newPassword, { type: argon2.argon2id });
     await pool.query('UPDATE users SET password_hash = ? WHERE id = ?', [newHash, userId]);
 
-    // 4. (Recommended Security) Revoke all other sessions for this user
-    await pool.query('UPDATE sessions SET revoked_at = NOW() WHERE user_id = ?', [userId]);
-
-    res.json({ ok: true } as OkResponseDto);
+    // 4. (Recommended Security) Revoke all other sessions for this user\n    await pool.query('UPDATE sessions SET revoked_at = NOW() WHERE user_id = ?', [userId]);\n\n    // Security: Revoke all trusted devices so bypass cannot persist after password change\n    await revokeAllTrustedDevices(String(userId));\n\n    res.json({ ok: true } as OkResponseDto);
   } catch (e) {
     next(e);
   }
@@ -389,7 +602,7 @@ auth.post('/verify-email', async (req, res, next) => {
       verification.user_id,
     ]);
 
-    res.json({ ok: true } as OkResponseDto);
+    // Security: Revoke all trusted devices so bypass cannot persist after password change\n    await revokeAllTrustedDevices(String(userId));\n\n    res.json({ ok: true } as OkResponseDto);
   } catch (e) {
     next(e);
   }
@@ -586,6 +799,58 @@ auth.get('/google/callback', async (req, res, next) => {
     }
 
     if (u.mfa_enabled) {
+      // Trusted device bypass for Google OAuth as well
+      try {
+        const isTrusted = await validateTrustedCookie(req, String(u.id), u.role as 'user' | 'admin');
+        if (isTrusted) {
+          const role = u.role as 'user' | 'admin';
+          const ttlSec = ttlForRole(role, Boolean(state.remember));
+
+          const sid = ulid();
+          const refresh = signRefresh({ sub: String(u.id), sid }, ttlSec);
+          const refreshHash = sha256(refresh);
+          const ua = req.get('user-agent') ?? null;
+          const ip = req.ip ?? null;
+
+          const [row] = await pool.query<RowDataPacket[]>('SELECT NOW() AS now');
+          const now = new Date(row[0].now);
+          const exp = new Date(now.getTime() + ttlSec * 1000);
+
+          await pool.query(
+            `INSERT INTO sessions (id, user_id, refresh_hash, user_agent, ip, remember, expires_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            [sid, String(u.id), refreshHash, ua, ip, state.remember ? 1 : 0, exp]
+          );
+
+          setRefreshCookie(res, refresh, {
+            remember: Boolean(state.remember),
+            maxAgeSec: ttlSec,
+          });
+          const access = signAccess({ sub: String(u.id), role });
+
+          const userPayload = {
+            id: String(u.id),
+            fullName: u.full_name,
+            email: u.email,
+            phone: u.phone,
+            role,
+          };
+
+          const frag = new URLSearchParams({
+            accessToken: access,
+            user: Buffer.from(
+              JSON.stringify({ ...userPayload, mfaEnabled: Boolean(u.mfa_enabled) })
+            ).toString('base64url'),
+            next: state.next || '/account',
+            store: state.remember ? 'local' : 'session',
+          }).toString();
+
+          return res.redirect(`${env.FRONTEND_BASE_URL}/oauth/google#${frag}`);
+        }
+      } catch (e) {
+        logger.warn({ e, userId: String(u.id) }, 'Google trusted-device bypass failed');
+      }
+
       const pendingId = ulid();
 
       const [rowNow] = await pool.query<RowDataPacket[]>('SELECT NOW() AS now');
@@ -655,7 +920,9 @@ auth.get('/google/callback', async (req, res, next) => {
     // Redirect to frontend handler with fragment
     const frag = new URLSearchParams({
       accessToken: access,
-      user: Buffer.from(JSON.stringify(userPayload)).toString('base64url'),
+      user: Buffer.from(
+        JSON.stringify({ ...userPayload, mfaEnabled: Boolean(u.mfa_enabled) })
+      ).toString('base64url'),
       next: state.next || '/account',
       store: state.remember ? 'local' : 'session',
     }).toString();
@@ -691,6 +958,48 @@ auth.post('/login', loginByIpLimiter, loginByEmailLimiter, async (req, res, next
     }
 
     if (u.mfa_enabled) {
+      // Trusted device bypass (DB-backed with legacy fallback)
+      try {
+        const isTrusted = await validateTrustedCookie(req, String(u.id), u.role as 'user' | 'admin');
+        if (isTrusted) {
+          const role = u.role as 'user' | 'admin';
+          const ttlSec = ttlForRole(role, Boolean(remember));
+          const sid = ulid();
+          const refresh = signRefresh({ sub: String(u.id), sid }, ttlSec);
+          const refreshHash = sha256(refresh);
+          const [row2] = await pool.query<RowDataPacket[]>('SELECT NOW() AS now');
+          const now2 = new Date(row2[0].now);
+          const exp2 = new Date(now2.getTime() + ttlSec * 1000);
+          await pool.query(
+            `INSERT INTO sessions (id, user_id, refresh_hash, user_agent, ip, remember, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            [
+              sid,
+              String(u.id),
+              refreshHash,
+              req.get('user-agent') ?? null,
+              req.ip ?? null,
+              remember ? 1 : 0,
+              exp2,
+            ]
+          );
+          setRefreshCookie(res, refresh, { remember: Boolean(remember), maxAgeSec: ttlSec });
+          const access = signAccess({ sub: String(u.id), role });
+          return res.json({
+            accessToken: access,
+            user: {
+              id: String(u.id),
+              fullName: u.full_name,
+              email: u.email,
+              phone: u.phone,
+              role,
+              mfaEnabled: Boolean(u.mfa_enabled),
+            },
+          });
+        }
+      } catch (err) {
+        logger.error({ err, userId: String(u.id) }, 'Trusted-device bypass failed; falling back to MFA');
+        // Intentionally continue to MFA challenge below
+      }
       const pendingId = ulid();
 
       const [row] = await pool.query<RowDataPacket[]>('SELECT NOW() AS now');
@@ -718,15 +1027,16 @@ auth.post('/login', loginByIpLimiter, loginByEmailLimiter, async (req, res, next
       } as MfaChallengeDto);
     }
 
+    // No MFA: create session and return tokens
     const role = u.role as 'user' | 'admin';
     const ttlSec = ttlForRole(role, Boolean(remember));
     const sid = ulid();
     const refresh = signRefresh({ sub: String(u.id), sid }, ttlSec);
     const refreshHash = sha256(refresh);
 
-    const [row] = await pool.query<RowDataPacket[]>('SELECT NOW() AS now');
-    const now = new Date(row[0].now);
-    const exp = new Date(now.getTime() + ttlSec * 1000);
+    const [row2] = await pool.query<RowDataPacket[]>('SELECT NOW() AS now');
+    const now2 = new Date(row2[0].now);
+    const exp2 = new Date(now2.getTime() + ttlSec * 1000);
 
     await pool.query(
       `INSERT INTO sessions (id, user_id, refresh_hash, user_agent, ip, remember, expires_at)
@@ -738,14 +1048,11 @@ auth.post('/login', loginByIpLimiter, loginByEmailLimiter, async (req, res, next
         req.get('user-agent') ?? null,
         req.ip ?? null,
         remember ? 1 : 0,
-        exp,
+        exp2,
       ]
     );
 
-    setRefreshCookie(res, refresh, {
-      remember: Boolean(remember),
-      maxAgeSec: ttlSec,
-    });
+    setRefreshCookie(res, refresh, { remember: Boolean(remember), maxAgeSec: ttlSec });
     const access = signAccess({ sub: String(u.id), role });
     res.json({
       accessToken: access,
@@ -755,6 +1062,7 @@ auth.post('/login', loginByIpLimiter, loginByEmailLimiter, async (req, res, next
         email: u.email,
         phone: u.phone,
         role,
+        mfaEnabled: Boolean(u.mfa_enabled),
       },
     });
   } catch (e) {
@@ -764,13 +1072,13 @@ auth.post('/login', loginByIpLimiter, loginByEmailLimiter, async (req, res, next
 
 auth.post('/mfa/login/verify', mfaVerifyLimiter, async (req, res, next) => {
   try {
-    const { challengeId, code } = z
+    const { challengeId, code, rememberDevice } = z
       .object({
         challengeId: z.string().min(10),
-        code: z.string().min(4).max(64), // allow both 6-digit and formatted backup codes
+        code: z.string().min(4).max(64),
+        rememberDevice: z.boolean().optional().default(false), // allow both 6-digit and formatted backup codes
       })
       .parse(req.body);
-
     // Load pending
     const [rows] = await pool.query<RowDataPacket[]>(
       `SELECT ml.user_id, ml.remember, ml.expires_at, ml.consumed_at,
@@ -782,16 +1090,18 @@ auth.post('/mfa/login/verify', mfaVerifyLimiter, async (req, res, next) => {
       [challengeId]
     );
     const rec = rows[0];
-    if (!rec || rec.consumed_at) return res.status(400).json({ error: 'Invalid challenge' });
+    if (!rec || rec.consumed_at)
+      return res.status(400).json({ code: 'InvalidChallenge', message: 'Invalid challenge' });
     if (new Date(rec.expires_at) < new Date())
-      return res.status(400).json({ error: 'Challenge expired' });
+      return res.status(400).json({ code: 'ChallengeExpired', message: 'Challenge expired' });
 
     const userId = String(rec.user_id);
 
     // 1) Try TOTP
     let ok = false;
     if (/^\d{6}$/.test(code)) {
-      if (!rec.mfa_secret_enc) return res.status(400).json({ error: 'MFA misconfigured' });
+      if (!rec.mfa_secret_enc)
+        return res.status(400).json({ code: 'MfaMisconfigured', message: 'MFA misconfigured' });
       const secretRaw = decryptFromBlob(Buffer.from(rec.mfa_secret_enc));
       ok = verifyTotp(code, secretRaw);
     }
@@ -812,7 +1122,8 @@ auth.post('/mfa/login/verify', mfaVerifyLimiter, async (req, res, next) => {
       }
     }
 
-    if (!ok) return res.status(400).json({ error: 'Invalid code' });
+    if (!ok)
+      return res.status(400).json({ code: 'InvalidCode', message: 'Invalid 2FA or backup code' });
 
     // Consume pending
     await pool.query(`UPDATE mfa_login_challenges SET consumed_at = NOW() WHERE id = ?`, [
@@ -847,22 +1158,25 @@ auth.post('/mfa/login/verify', mfaVerifyLimiter, async (req, res, next) => {
     );
 
     setRefreshCookie(res, refresh, { remember, maxAgeSec: ttlSec });
+    if (rememberDevice) {
+      await createTrustedDevice(req, res, userId);
+    }
     const access = signAccess({ sub: userId, role });
     res.json({
       accessToken: access,
       user: {
-        id: userId,
+        id: String(userId),
         fullName: rec.full_name,
         email: rec.email,
         phone: rec.phone,
         role,
+        mfaEnabled: true,
       },
-    } as AuthOutputDto);
+    });
   } catch (e) {
     next(e);
   }
 });
-
 /** POST /api/auth/refresh */
 auth.post('/refresh', async (req, res, next) => {
   try {
@@ -924,13 +1238,41 @@ auth.post('/refresh', async (req, res, next) => {
     const access = signAccess({ sub: userId, role });
 
     res.json({ accessToken: access } as RefreshResponseDto);
-  } catch {
-    return res.status(401).json({ error: 'Invalid token' });
+  } catch (error) {
+    // <-- ADD missing catch
+    next(error); // <-- ADD next parameter or handle error
   }
 });
-
 /** POST /api/auth/logout */
-auth.post('/logout', async (req, res) => {
+
+/** POST /api/auth/logout-all - revoke all sessions and trusted devices */
+auth.post('/logout-all', requireAuth, async (req, res) => {
+  try {
+    if (!req.user) return res.status(401).json({ error: 'Authentication required' });
+    const userId = String(req.user.id);
+
+    await pool.query(`UPDATE sessions SET revoked_at = NOW() WHERE user_id = ? AND revoked_at IS NULL`, [userId]);
+    await revokeAllTrustedDevices(userId);
+
+    res.clearCookie(env.REFRESH_COOKIE_NAME, {
+      path: '/api',
+      domain: env.COOKIE_DOMAIN || undefined,
+      sameSite: 'lax',
+      secure: env.NODE_ENV === 'production',
+    });
+    res.clearCookie('mm_trusted', {
+      path: '/',
+      domain: env.COOKIE_DOMAIN || undefined,
+      sameSite: 'lax',
+      secure: env.NODE_ENV === 'production',
+    });
+
+    logger.info({ code: 'UserLogoutAll', userId }, 'User requested logout on all devices');
+    return res.status(204).end();
+  } catch (e) {
+    return res.status(500).json({ error: 'Failed to logout all' });
+  }
+});auth.post('/logout', async (req, res) => {
   try {
     const token = req.cookies?.[env.REFRESH_COOKIE_NAME];
     if (token) {
@@ -943,14 +1285,129 @@ auth.post('/logout', async (req, res) => {
     }
     // clear with matching options so the cookie actually deletes
     res.clearCookie(env.REFRESH_COOKIE_NAME, {
-      path: '/api/auth',
+      path: '/api',
       domain: env.COOKIE_DOMAIN || undefined,
       sameSite: 'lax',
       secure: env.NODE_ENV === 'production',
     });
+   
     res.status(204).end();
   } catch {
     return res.status(401).json({ error: 'Invalid token' });
+  }
+});
+
+// ===== Trusted Devices: list and revoke =====
+auth.get('/trusted-devices', requireAuth, async (req, res, next) => {
+  try {
+    if (!req.user) return res.status(401).json({ error: 'Authentication required' });
+    const userId = String(req.user.id);
+
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `SELECT id, user_id, user_agent, ip, created_at, last_used_at, expires_at, revoked_at
+         FROM trusted_devices
+        WHERE user_id = ?
+        ORDER BY created_at DESC`,
+      [userId]
+    );
+
+    const cookie = String(req.cookies?.mm_trusted || '');
+    const currentId = cookie.includes('.') ? cookie.split('.')[0] : '';
+
+    const devices = rows.map((d) => ({
+      id: String(d.id),
+      userAgent: d.user_agent as string | null,
+      ip: d.ip as string | null,
+      createdAt: d.created_at ? new Date(d.created_at).toISOString() : null,
+      lastUsedAt: d.last_used_at ? new Date(d.last_used_at).toISOString() : null,
+      expiresAt: d.expires_at ? new Date(d.expires_at).toISOString() : null,
+      revokedAt: d.revoked_at ? new Date(d.revoked_at).toISOString() : null,
+      current: String(d.id) === currentId,
+    }));
+
+    res.json({ items: devices });
+  } catch (e) {
+    next(e);
+  }
+});
+
+auth.post('/trusted-devices/revoke', requireAuth, async (req, res, next) => {
+  try {
+    if (!req.user) return res.status(401).json({ error: 'Authentication required' });
+    const userId = String(req.user.id);
+    const { id } = z.object({ id: z.string().min(10) }).parse(req.body);
+
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `SELECT id FROM trusted_devices WHERE id = ? AND user_id = ? AND revoked_at IS NULL LIMIT 1`,
+      [id, userId]
+    );
+    const rec = rows[0];
+    if (!rec) return res.status(404).json({ error: 'Not found' });
+
+    await pool.query(`UPDATE trusted_devices SET revoked_at = NOW() WHERE id = ?`, [id]);
+
+    // If this is the current cookie, clear it
+    const cookie = String(req.cookies?.mm_trusted || '');
+    const currentId = cookie.includes('.') ? cookie.split('.')[0] : '';
+    if (currentId === id) {
+      res.clearCookie('mm_trusted', {
+        path: '/',
+        domain: env.COOKIE_DOMAIN || undefined,
+        sameSite: 'lax',
+        secure: env.NODE_ENV === 'production',
+      });
+    }
+    // Security: Revoke all trusted devices so bypass cannot persist after password change\n    await revokeAllTrustedDevices(String(userId));\n\n    res.json({ ok: true } as OkResponseDto);
+  } catch (e) {
+    next(e);
+  }
+});
+
+auth.post('/trusted-devices/revoke-all', requireAuth, async (req, res, next) => {
+  try {
+    if (!req.user) return res.status(401).json({ error: 'Authentication required' });
+    const userId = String(req.user.id);
+
+    await pool.query(`UPDATE trusted_devices SET revoked_at = NOW() WHERE user_id = ? AND revoked_at IS NULL`, [
+      userId,
+    ]);
+
+    // Clear cookie if present
+    if (req.cookies?.mm_trusted) {
+      res.clearCookie('mm_trusted', {
+        path: '/',
+        domain: env.COOKIE_DOMAIN || undefined,
+        sameSite: 'lax',
+        secure: env.NODE_ENV === 'production',
+      });
+    }
+    // Security: Revoke all trusted devices so bypass cannot persist after password change\n    await revokeAllTrustedDevices(String(userId));\n\n    res.json({ ok: true } as OkResponseDto);
+  } catch (e) {
+    next(e);
+  }
+});
+
+auth.post('/trusted-devices/untrust-current', requireAuth, async (req, res, next) => {
+  try {
+    if (!req.user) return res.status(401).json({ error: 'Authentication required' });
+    const userId = String(req.user.id);
+    const cookie = String(req.cookies?.mm_trusted || '');
+    if (!cookie.includes('.')) return res.status(400).json({ error: 'No trusted device cookie' });
+    const [id] = cookie.split('.');
+
+    await pool.query(`UPDATE trusted_devices SET revoked_at = NOW() WHERE id = ? AND user_id = ?`, [
+      id,
+      userId,
+    ]);
+    res.clearCookie('mm_trusted', {
+      path: '/',
+      domain: env.COOKIE_DOMAIN || undefined,
+      sameSite: 'lax',
+      secure: env.NODE_ENV === 'production',
+    });
+    // Security: Revoke all trusted devices so bypass cannot persist after password change\n    await revokeAllTrustedDevices(String(userId));\n\n    res.json({ ok: true } as OkResponseDto);
+  } catch (e) {
+    next(e);
   }
 });
 
@@ -962,7 +1419,7 @@ auth.get('/me', async (req, res) => {
   try {
     const { sub } = verifyAccess(token);
     const [rows] = await pool.query<RowDataPacket[]>(
-      `SELECT id, full_name, email, phone, role, status FROM users WHERE id = ? LIMIT 1`,
+      `SELECT id, full_name, email, phone, role, status, mfa_enabled FROM users WHERE id = ? LIMIT 1`,
       [sub]
     );
     const u = rows[0];
@@ -974,12 +1431,53 @@ auth.get('/me', async (req, res) => {
       phone: u.phone,
       role: u.role,
       status: u.status,
+      mfaEnabled: Boolean(u.mfa_enabled),
     } as UserDto);
   } catch {
     return res.status(401).json({ error: 'Invalid token' });
   }
 });
 
+/** POST /api/auth/me/update - update full name and phone */
+auth.post('/me/update', requireAuth, async (req, res, next) => {
+  try {
+    if (!req.user) return res.status(401).json({ error: 'Authentication required' });
+    const userId = String(req.user.id);
+
+    const body = UpdateProfile.parse(req.body);
+    const phoneVal = body.phone === undefined ? undefined : body.phone; // allow explicit null
+
+    // Build dynamic update set to avoid touching email
+    const fields: string[] = ['full_name = ?'];
+    const values: Array<string | null> = [body.fullName];
+    if (phoneVal !== undefined) {
+      fields.push('phone = ?');
+      values.push(phoneVal);
+    }
+    values.push(userId);
+
+    await pool.query(`UPDATE users SET ${fields.join(', ')} WHERE id = ?`, values as never);
+
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `SELECT id, full_name, email, phone, role, status, mfa_enabled FROM users WHERE id = ? LIMIT 1`,
+      [userId]
+    );
+    const u = rows[0];
+    if (!u) return res.status(404).json({ error: 'Not found' });
+
+    res.json({
+      id: String(u.id),
+      fullName: u.full_name,
+      email: u.email,
+      phone: u.phone,
+      role: u.role,
+      status: u.status,
+      mfaEnabled: Boolean(u.mfa_enabled),
+    } as UserDto);
+  } catch (e) {
+    return next(e);
+  }
+});
 // ===== Resend Verification Email =====
 auth.post('/verify-email/resend', async (req, res) => {
   try {
@@ -998,9 +1496,10 @@ auth.post('/verify-email/resend', async (req, res) => {
     }
 
     // Always return OK to prevent email enumeration
-    res.json({ ok: true } as OkResponseDto);
-  } catch {
-    return res.status(401).json({ error: 'Invalid token' });
+    // Security: Revoke all trusted devices so bypass cannot persist after password change\n    await revokeAllTrustedDevices(String(userId));\n\n    res.json({ ok: true } as OkResponseDto);
+  } catch (error) {
+    // <-- ADD missing catch
+    return res.status(400).json({ error: 'Invalid request' });
   }
 });
 
@@ -1039,9 +1538,9 @@ auth.post('/forgot', async (req, res) => {
     }
 
     // Always send a generic success response
-    res.json({ ok: true } as OkResponseDto);
-  } catch {
-    return res.status(401).json({ error: 'Invalid token' });
+    // Security: Revoke all trusted devices so bypass cannot persist after password change\n    await revokeAllTrustedDevices(String(userId));\n\n    res.json({ ok: true } as OkResponseDto);
+  } catch (e) {
+    return res.status(400).json({ error: 'Invalid request' });
   }
 });
 
@@ -1074,8 +1573,8 @@ auth.post('/reset', async (req, res) => {
     await pool.query(`UPDATE sessions SET revoked_at = NOW() WHERE user_id = ?`, [
       String(r.user_id),
     ]);
-    res.json({ ok: true } as OkResponseDto);
-  } catch {
-    return res.status(401).json({ error: 'Invalid token' });
+    // Security: Revoke all trusted devices so bypass cannot persist after password change\n    await revokeAllTrustedDevices(String(userId));\n\n    res.json({ ok: true } as OkResponseDto);
+  } catch (e) {
+    return res.status(400).json({ error: 'Invalid request' });
   }
 });

@@ -56,6 +56,7 @@ const Env = z.object({
     ),
   BACKUP_CODE_HMAC_SECRET: z.string().min(32),
   TRUSTED_DEVICE_TTL_DAYS: z.coerce.number().default(30),
+  TRUSTED_DEVICE_FINGERPRINT_ENABLED: z.coerce.boolean().default(false),
   TOTP_STEP_SEC: z.coerce.number().default(30), // 30s window (RFC 6238)
   TOTP_WINDOW_STEPS: z.coerce.number().default(1), // ±1 step tolerance
   MFA_CHALLENGE_TTL_SEC: z.coerce.number().default(600), // setup QR validity (10m)
