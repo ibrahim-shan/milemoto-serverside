@@ -89,11 +89,10 @@ async function runFile(filename: string) {
     console.log('RUN:', filename, '| DB=', dbrow[0]?.db, '| statements=', stmts.length);
 
     await conn.beginTransaction();
-    for (let i = 0; i < stmts.length; i++) {
-      const stmt = stmts[i];
+    for (const [i, stmt] of stmts.entries()) {
       try {
-        // short preview
-        console.log(`  [${i + 1}/${stmts.length}]`, stmt.slice(0, 100).replace(/\s+/g, ' '), '...');
+        const preview = stmt.slice(0, 100).replace(/\s+/g, ' ');
+        console.log(`  [${i + 1}/${stmts.length}]`, preview, '...');
         await conn.query(stmt);
       } catch (err) {
         console.error('  FAILED stmt index', i, 'file', filename);

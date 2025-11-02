@@ -17,6 +17,7 @@ import {
   revokeAllTrustedDevices,
   sendNewVerificationEmail,
 } from './auth.helpers.js';
+import { dbNow } from '../../db/time.js';
 
 export const passwordAuth = Router();
 
@@ -126,8 +127,8 @@ passwordAuth.post('/forgot', async (req, res, next) => {
     if (u) {
       const token = randToken(32);
       const hash = sha256(token);
-      const [row] = await pool.query<RowDataPacket[]>('SELECT NOW() AS now');
-      const exp = new Date(new Date(row[0].now).getTime() + 60 * 60 * 1000); // 1h
+      const now = await dbNow();
+      const exp = new Date(now.getTime() + 60 * 60 * 1000); // 1h
       await pool.query(
         `INSERT INTO password_resets (user_id, token_hash, expires_at) VALUES (?, ?, ?)`,
         [String(u.id), hash, exp]

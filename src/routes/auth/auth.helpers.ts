@@ -12,6 +12,8 @@ import { ulid } from 'ulid';
 import { RowDataPacket } from 'mysql2';
 import { sendVerificationEmail } from '../../services/emailService.js';
 import { ipPrefix } from '../../utils/device.js';
+import { dbNow } from '../../db/time.js';
+
 
 // --- Zod Schemas ---
 export const Register = z.object({
@@ -152,8 +154,7 @@ export async function createTrustedDevice(req: Request, res: Response, userId: s
     const token = crypto.randomBytes(32).toString('base64url');
     const tokenHash = sha256(token);
     const id = ulid();
-    const [row] = await pool.query<RowDataPacket[]>(`SELECT NOW() AS now`);
-    const now = new Date(row[0].now);
+    const now = await dbNow();
     const exp = new Date(now.getTime() + Number(env.TRUSTED_DEVICE_TTL_DAYS) * 24 * 60 * 60 * 1000);
     const ua = req.get('user-agent') ?? null;
     const fp = sha256(`${ua || ''}|${ipPrefix(req.ip)}`);
@@ -260,8 +261,8 @@ export async function sendNewVerificationEmail(userId: string, email: string) {
   try {
     const token = randToken(32);
     const hash = sha256(token);
-    const [row] = await pool.query<RowDataPacket[]>('SELECT NOW() AS now');
-    const exp = new Date(new Date(row[0].now).getTime() + 24 * 60 * 60 * 1000); // 24 hours
+    const now = await dbNow();
+    const exp = new Date(now.getTime() + 24 * 60 * 60 * 1000); // 24 hours
 
     await pool.query(
       `INSERT INTO email_verifications (user_id, token_hash, expires_at) VALUES (?, ?, ?)`,

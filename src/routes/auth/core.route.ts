@@ -25,8 +25,10 @@ import {
   sendNewVerificationEmail,
   revokeAllTrustedDevices,
 } from './auth.helpers.js';
+import { dbNow } from '../../db/time.js';
 
 export const coreAuth = Router();
+
 
 /** POST /api/auth/register */
 coreAuth.post('/register', async (req, res, next) => {
@@ -36,7 +38,7 @@ coreAuth.post('/register', async (req, res, next) => {
 
     const [result] = await pool.query<ResultSetHeader>(
       `INSERT INTO users (full_name, email, phone, password_hash, role, status)
-       VALUES (?, ?, ?, ?, 'user', 'active')`,
+        VALUES (?, ?, ?, ?, 'user', 'active')`,
       [fullName, email.toLowerCase(), phone ?? null, hash]
     );
 
@@ -81,7 +83,7 @@ coreAuth.post('/login', loginByIpLimiter, loginByEmailLimiter, async (req, res, 
 
     const [rows] = await pool.query<RowDataPacket[]>(
       `SELECT id, full_name, email, phone, password_hash, role, status, mfa_enabled, email_verified_at
-         FROM users WHERE email = ? LIMIT 1`,
+          FROM users WHERE email = ? LIMIT 1`,
       [email.toLowerCase()]
     );
     const u = rows[0];
@@ -112,8 +114,8 @@ coreAuth.post('/login', loginByIpLimiter, loginByEmailLimiter, async (req, res, 
           const sid = ulid();
           const refresh = signRefresh({ sub: String(u.id), sid }, ttlSec);
           const refreshHash = sha256(refresh);
-          const [row2] = await pool.query<RowDataPacket[]>('SELECT NOW() AS now');
-          const now2 = new Date(row2[0].now);
+          const now2 = await dbNow();
+
           const exp2 = new Date(now2.getTime() + ttlSec * 1000);
           await pool.query(
             `INSERT INTO sessions (id, user_id, refresh_hash, user_agent, ip, remember, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
@@ -149,13 +151,12 @@ coreAuth.post('/login', loginByIpLimiter, loginByEmailLimiter, async (req, res, 
       }
 
       const pendingId = ulid();
-      const [row] = await pool.query<RowDataPacket[]>('SELECT NOW() AS now');
-      const now = new Date(row[0].now);
+      const now = await dbNow();
       const exp = new Date(now.getTime() + Number(env.MFA_LOGIN_TTL_SEC) * 1000);
 
       await pool.query(
         `INSERT INTO mfa_login_challenges (id, user_id, remember, user_agent, ip, expires_at)
-         VALUES (?, ?, ?, ?, ?, ?)`,
+          VALUES (?, ?, ?, ?, ?, ?)`,
         [
           pendingId,
           String(u.id),
@@ -181,13 +182,12 @@ coreAuth.post('/login', loginByIpLimiter, loginByEmailLimiter, async (req, res, 
     const refresh = signRefresh({ sub: String(u.id), sid }, ttlSec);
     const refreshHash = sha256(refresh);
 
-    const [row2] = await pool.query<RowDataPacket[]>('SELECT NOW() AS now');
-    const now2 = new Date(row2[0].now);
+    const now2 = await dbNow();
     const exp2 = new Date(now2.getTime() + ttlSec * 1000);
 
     await pool.query(
       `INSERT INTO sessions (id, user_id, refresh_hash, user_agent, ip, remember, expires_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        VALUES (?, ?, ?, ?, ?, ?, ?)`,
       [
         sid,
         String(u.id),
@@ -227,7 +227,7 @@ coreAuth.post('/refresh', async (req, res, next) => {
 
     const [rows] = await pool.query<RowDataPacket[]>(
       `SELECT refresh_hash, revoked_at, expires_at, remember
-         FROM sessions WHERE id = ? AND user_id = ? LIMIT 1`,
+          FROM sessions WHERE id = ? AND user_id = ? LIMIT 1`,
       [sid, userId]
     );
     const s = rows[0];
@@ -243,7 +243,9 @@ coreAuth.post('/refresh', async (req, res, next) => {
       `SELECT role FROM users WHERE id = ? LIMIT 1`,
       [userId]
     );
-    const role = urows[0].role as 'user' | 'admin';
+    const urec = urows[0];
+    if (!urec) return res.status(401).json({ error: 'User not found' });
+    const role = urec.role as 'user' | 'admin';
     const remember = Boolean(s.remember);
     const ttlSec = ttlForRole(role, remember);
 
@@ -256,13 +258,12 @@ coreAuth.post('/refresh', async (req, res, next) => {
       sid,
     ]);
 
-    const [row] = await pool.query<RowDataPacket[]>('SELECT NOW() AS now');
-    const now = new Date(row[0].now);
+    const now = await dbNow();
     const exp = new Date(now.getTime() + ttlSec * 1000);
 
     await pool.query(
       `INSERT INTO sessions (id, user_id, refresh_hash, user_agent, ip, remember, expires_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        VALUES (?, ?, ?, ?, ?, ?, ?)`,
       [
         newSid,
         userId,

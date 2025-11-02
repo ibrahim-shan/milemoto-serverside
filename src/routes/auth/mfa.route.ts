@@ -32,6 +32,7 @@ import {
   createTrustedDevice,
   ttlForRole,
 } from './auth.helpers.js';
+import { dbNow } from '../../db/time.js';
 
 export const mfaAuth = Router();
 
@@ -55,8 +56,7 @@ mfaAuth.post('/mfa/setup/start', requireAuth, async (req, res, next) => {
     const secretEnc = encryptToBlob(raw);
     const challengeId = ulid();
 
-    const [row] = await pool.query<RowDataPacket[]>('SELECT NOW() AS now');
-    const exp = new Date(new Date(row[0].now).getTime() + Number(env.MFA_CHALLENGE_TTL_SEC) * 1000);
+    const exp = new Date((await dbNow()).getTime() + Number(env.MFA_CHALLENGE_TTL_SEC) * 1000);
 
     await pool.query(
       'INSERT INTO mfa_challenges (id, user_id, secret_enc, expires_at) VALUES (?, ?, ?, ?)',
@@ -285,8 +285,7 @@ mfaAuth.post('/mfa/login/verify', mfaVerifyLimiter, async (req, res, next) => {
     const sid = ulid();
     const refresh = signRefresh({ sub: userId, sid }, ttlSec);
     const refreshHash = sha256(refresh);
-    const [row] = await pool.query<RowDataPacket[]>('SELECT NOW() AS now');
-    const now = new Date(row[0].now);
+    const now = await dbNow();
     const exp = new Date(now.getTime() + ttlSec * 1000);
 
     await pool.query(

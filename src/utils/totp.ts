@@ -54,12 +54,12 @@ export function totpCode(secret: Buffer, time = Date.now()): string {
   msg.writeBigUInt64BE(BigInt(counter));
   const hmac = createHmac('sha1', secret).update(msg).digest();
 
-  const offset = hmac[hmac.length - 1] & 0x0f;
-  const bin =
-    ((hmac[offset] & 0x7f) << 24) |
-    ((hmac[offset + 1] & 0xff) << 16) |
-    ((hmac[offset + 2] & 0xff) << 8) |
-    (hmac[offset + 3] & 0xff);
+  const last = hmac[hmac.length - 1] ?? 0;
+  const offset = last & 0x0f;
+  if (offset + 4 > hmac.length) {
+    throw new Error('TOTP: HMAC length too short');
+  }
+  const bin = hmac.readUInt32BE(offset) & 0x7fffffff;
 
   const mod = 1_000_000; // 6 digits
   return String(bin % mod).padStart(6, '0');

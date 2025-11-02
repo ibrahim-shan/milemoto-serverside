@@ -17,7 +17,8 @@ import {
   ttlForRole,
   setRefreshCookie,
 } from './auth.helpers.js';
-import { sha256 } from 'src/utils/crypto.js';
+import { sha256 } from '../../../src/utils/crypto.js';
+import { dbNow } from '../../db/time.js';
 
 export const oauthAuth = Router();
 
@@ -68,7 +69,9 @@ oauthAuth.get('/google/callback', async (req, res, next) => {
     if (!tok.id_token) return res.status(400).send('No id_token');
 
     // Decode id_token
-    const [, payloadB64] = tok.id_token.split('.');
+    const parts = tok.id_token.split('.');
+    if (parts.length < 2 || !parts[1]) return res.status(400).send('Bad id_token');
+    const payloadB64 = parts[1];
     const info = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8')) as {
       iss: string;
       aud: string;
@@ -98,10 +101,11 @@ oauthAuth.get('/google/callback', async (req, res, next) => {
     if (!emailRaw) return res.status(400).send('Google account missing email');
     const email = emailRaw.toLowerCase();
 
-    const name =
-      info.name ||
-      `${info.given_name || ''} ${info.family_name || ''}`.trim() ||
-      email.split('@')[0];
+   const nameStr = (
+  info.name?.trim() ||
+  `${info.given_name ?? ''} ${info.family_name ?? ''}`.trim() ||
+  email.split('@')[0]
+) as string;
 
     // Link or create user
     const [bySubRows] = await pool.query<RowDataPacket[]>(
@@ -142,12 +146,12 @@ oauthAuth.get('/google/callback', async (req, res, next) => {
       const [ins] = await pool.query<ResultSetHeader>(
         `INSERT INTO users (full_name, email, password_hash, role, status, email_verified_at, google_sub)
          VALUES (?, ?, ?, 'user', 'active', ?, ?)`,
-        [name, email, hash, info.email_verified ? new Date() : null, gsub]
+        [nameStr, email, hash, info.email_verified ? new Date() : null, gsub]
       );
       const userId = String(ins.insertId);
       u = {
         id: userId,
-        full_name: name,
+        full_name: nameStr,
         email,
         phone: null,
         role: 'user',
@@ -156,6 +160,7 @@ oauthAuth.get('/google/callback', async (req, res, next) => {
         email_verified_at: info.email_verified ? new Date() : null,
       };
     }
+    if (!u) return res.status(500).send('User resolution failed');
 
     if (!u.email_verified_at) {
       return res.redirect(`${env.FRONTEND_BASE_URL}/signin?error=EmailNotVerified`);
@@ -179,8 +184,7 @@ oauthAuth.get('/google/callback', async (req, res, next) => {
           const refreshHash = sha256(refresh);
           const ua = req.get('user-agent') ?? null;
           const ip = req.ip ?? null;
-          const [row] = await pool.query<RowDataPacket[]>('SELECT NOW() AS now');
-          const now = new Date(row[0].now);
+          const now = await dbNow();
           const exp = new Date(now.getTime() + ttlSec * 1000);
           await pool.query(
             `INSERT INTO sessions (id, user_id, refresh_hash, user_agent, ip, remember, expires_at)
@@ -215,8 +219,7 @@ oauthAuth.get('/google/callback', async (req, res, next) => {
 
       // MFA challenge
       const pendingId = ulid();
-      const [rowNow] = await pool.query<RowDataPacket[]>('SELECT NOW() AS now');
-      const now = new Date(rowNow[0].now);
+      const now = await dbNow();
       const exp = new Date(now.getTime() + Number(env.MFA_LOGIN_TTL_SEC) * 1000);
       await pool.query(
         `INSERT INTO mfa_login_challenges
@@ -249,8 +252,7 @@ oauthAuth.get('/google/callback', async (req, res, next) => {
     const refreshHash = sha256(refresh);
     const ua = req.get('user-agent') ?? null;
     const ip = req.ip ?? null;
-    const [row] = await pool.query<RowDataPacket[]>('SELECT NOW() AS now');
-    const now = new Date(row[0].now);
+    const now = await dbNow();
     const exp = new Date(now.getTime() + ttlSec * 1000);
 
     await pool.query(
