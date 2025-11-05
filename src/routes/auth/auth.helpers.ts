@@ -14,7 +14,6 @@ import { sendVerificationEmail } from '../../services/emailService.js';
 import { ipPrefix } from '../../utils/device.js';
 import { dbNow } from '../../db/time.js';
 
-
 // --- Zod Schemas ---
 export const Register = z.object({
   fullName: z.string().min(2).max(191),

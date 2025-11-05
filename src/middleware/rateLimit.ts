@@ -1,28 +1,29 @@
 // src/middleware/rateLimit.ts
 import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
 import type { Request } from 'express';
+import { env } from '../config/env.js';
 
 const ipOf = (req: Request) => ipKeyGenerator(req.ip ?? req.socket?.remoteAddress ?? '');
 
 export const authLimiter = rateLimit({
-  windowMs: 60_000,
-  limit: 120,
+  windowMs: env.RATE_AUTH_WINDOW_MS,
+  limit: env.RATE_AUTH_MAX,
   standardHeaders: 'draft-8',
   legacyHeaders: false,
   keyGenerator: (req) => ipOf(req),
 });
 
 export const loginByIpLimiter = rateLimit({
-  windowMs: 15 * 60_000,
-  limit: 10,
+  windowMs: env.RATE_LOGIN_IP_WINDOW_MS,
+  limit: env.RATE_LOGIN_IP_MAX,
   standardHeaders: 'draft-8',
   legacyHeaders: false,
   keyGenerator: (req) => ipOf(req),
 });
 
 export const loginByEmailLimiter = rateLimit({
-  windowMs: 15 * 60_000,
-  limit: 5,
+  windowMs: env.RATE_LOGIN_EMAIL_WINDOW_MS,
+  limit: env.RATE_LOGIN_EMAIL_MAX,
   standardHeaders: 'draft-8',
   legacyHeaders: false,
   keyGenerator: (req) => {
@@ -32,16 +33,16 @@ export const loginByEmailLimiter = rateLimit({
 });
 
 export const uploadsByIpLimiter = rateLimit({
-  windowMs: 60_000, // 1 minute bucket
-  limit: 30, // max 30 signed URLs / min per IP
+  windowMs: env.RATE_UPLOAD_IP_WINDOW_MS,
+  limit: env.RATE_UPLOAD_IP_MAX,
   standardHeaders: 'draft-8',
   legacyHeaders: false,
   keyGenerator: (req) => ipOf(req), // IPv6-safe via ipKeyGenerator
 });
 
 export const uploadsByUserLimiter = rateLimit({
-  windowMs: 60_000, // 1 minute bucket
-  limit: 20, // max 20 signed URLs / min per user
+  windowMs: env.RATE_UPLOAD_USER_WINDOW_MS,
+  limit: env.RATE_UPLOAD_USER_MAX,
   standardHeaders: 'draft-8',
   legacyHeaders: false,
   keyGenerator: (req) => {
@@ -52,8 +53,8 @@ export const uploadsByUserLimiter = rateLimit({
 });
 
 export const mfaVerifyLimiter = rateLimit({
-  windowMs: 10 * 60_000, // 10 minutes
-  limit: 6, // max 6 attempts per challenge window
+  windowMs: env.RATE_MFA_WINDOW_MS,
+  limit: env.RATE_MFA_MAX,
   standardHeaders: 'draft-8',
   legacyHeaders: false,
   keyGenerator: (req) => {

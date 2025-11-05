@@ -29,7 +29,6 @@ import { dbNow } from '../../db/time.js';
 
 export const coreAuth = Router();
 
-
 /** POST /api/auth/register */
 coreAuth.post('/register', async (req, res, next) => {
   try {

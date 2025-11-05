@@ -61,6 +61,19 @@ const Env = z.object({
   TOTP_WINDOW_STEPS: z.coerce.number().default(1), // ±1 step tolerance
   MFA_CHALLENGE_TTL_SEC: z.coerce.number().default(600), // setup QR validity (10m)
   MFA_LOGIN_TTL_SEC: z.coerce.number().default(300), // pending login validity (5m)
+
+  RATE_AUTH_WINDOW_MS: z.coerce.number().default(60_000),
+  RATE_AUTH_MAX: z.coerce.number().default(120),
+  RATE_LOGIN_IP_WINDOW_MS: z.coerce.number().default(15 * 60_000),
+  RATE_LOGIN_IP_MAX: z.coerce.number().default(10),
+  RATE_LOGIN_EMAIL_WINDOW_MS: z.coerce.number().default(15 * 60_000),
+  RATE_LOGIN_EMAIL_MAX: z.coerce.number().default(5),
+  RATE_UPLOAD_IP_WINDOW_MS: z.coerce.number().default(60_000),
+  RATE_UPLOAD_IP_MAX: z.coerce.number().default(30),
+  RATE_UPLOAD_USER_WINDOW_MS: z.coerce.number().default(60_000),
+  RATE_UPLOAD_USER_MAX: z.coerce.number().default(20),
+  RATE_MFA_WINDOW_MS: z.coerce.number().default(10 * 60_000),
+  RATE_MFA_MAX: z.coerce.number().default(6),
 });
 
 export const env = Env.parse(process.env);

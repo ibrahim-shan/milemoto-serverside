@@ -101,11 +101,9 @@ oauthAuth.get('/google/callback', async (req, res, next) => {
     if (!emailRaw) return res.status(400).send('Google account missing email');
     const email = emailRaw.toLowerCase();
 
-   const nameStr = (
-  info.name?.trim() ||
-  `${info.given_name ?? ''} ${info.family_name ?? ''}`.trim() ||
-  email.split('@')[0]
-) as string;
+    const nameStr = (info.name?.trim() ||
+      `${info.given_name ?? ''} ${info.family_name ?? ''}`.trim() ||
+      email.split('@')[0]) as string;
 
     // Link or create user
     const [bySubRows] = await pool.query<RowDataPacket[]>(
