@@ -21,6 +21,12 @@ export const locationAdmin = Router();
 // Apply security middleware to ALL routes defined in this file
 locationAdmin.use(requireAuth, requireRole('admin'));
 
+function isDuplicateEntry(error: unknown): error is { code: string } {
+  return Boolean(
+    error && typeof error === 'object' && 'code' in error && (error as { code?: string }).code === 'ER_DUP_ENTRY'
+  );
+}
+
 // ==== COUNTRIES =================================================
 
 /**
@@ -43,6 +49,12 @@ locationAdmin.post('/countries', async (req, res, next) => {
       status,
     });
   } catch (e) {
+    if (isDuplicateEntry(e)) {
+      return res.status(409).json({
+        code: 'DuplicateCountry',
+        message: 'Country code already exists.',
+      });
+    }
     next(e);
   }
 });
@@ -110,33 +122,94 @@ locationAdmin.post('/countries/:id', async (req, res, next) => {
       });
     }
 
-    // Build the SET clause dynamically to avoid overwriting fields with undefined
-    const fields: string[] = [];
-    const values: (string | number)[] = [];
-    for (const [key, value] of Object.entries(body)) {
-      if (value !== undefined) {
-        fields.push(`${key} = ?`);
-        values.push(value);
-      }
-    }
-    values.push(countryId);
+    const conn = await pool.getConnection();
+    let inTransaction = false;
+    try {
+      await conn.beginTransaction();
+      inTransaction = true;
 
-    const [result] = await pool.query<ResultSetHeader>(
+      // Build the SET clause dynamically to avoid overwriting fields with undefined
+      const fields: string[] = [];
+      const values: (string | number)[] = [];
+      for (const [key, value] of Object.entries(body)) {
+        if (value !== undefined) {
+          fields.push(`${key} = ?`);
+          values.push(value);
+        }
+      }
+      values.push(countryId);
+
+    const [result] = await conn.query<ResultSetHeader>(
       `UPDATE countries SET ${fields.join(', ')} WHERE id = ?`,
       values
     );
 
-    if (result.affectedRows === 0) {
-      return res.status(404).json({ code: 'NotFound', message: 'Country not found' });
-    }
+      if (result.affectedRows === 0) {
+        await conn.rollback();
+        return res.status(404).json({ code: 'NotFound', message: 'Country not found' });
+      }
 
-    // Return the updated record
-    const [rows] = await pool.query<RowDataPacket[]>('SELECT * FROM countries WHERE id = ?', [
-      countryId,
-    ]);
-    res.json(rows[0]);
+      if (body.status === 'inactive') {
+        await conn.query(`UPDATE states SET status_effective = 'inactive' WHERE country_id = ?`, [
+          countryId,
+        ]);
+        await conn.query(
+          `UPDATE cities c
+             JOIN states s ON c.state_id = s.id
+           SET c.status_effective = 'inactive'
+         WHERE s.country_id = ?`,
+          [countryId]
+        );
+      } else if (body.status === 'active') {
+        await conn.query(
+          `UPDATE states
+              SET status_effective = CASE WHEN status = 'active' THEN 'active' ELSE 'inactive' END
+            WHERE country_id = ?`,
+          [countryId]
+        );
+        await conn.query(
+          `UPDATE cities c
+             JOIN states s ON c.state_id = s.id
+           SET c.status_effective =
+             CASE
+               WHEN c.status = 'active' AND s.status_effective = 'active' THEN 'active'
+               ELSE 'inactive'
+             END
+         WHERE s.country_id = ?`,
+          [countryId]
+        );
+      }
+
+      const [rows] = await conn.query<RowDataPacket[]>('SELECT * FROM countries WHERE id = ?', [
+        countryId,
+      ]);
+
+      await conn.commit();
+      return res.json(rows[0]);
+    } catch (e) {
+      if (inTransaction) {
+        try {
+          await conn.rollback();
+        } catch {}
+      }
+      if (isDuplicateEntry(e)) {
+        return res.status(409).json({
+          code: 'DuplicateCountry',
+          message: 'Country code already exists.',
+        });
+      }
+      return next(e);
+    } finally {
+      conn.release();
+    }
   } catch (e) {
-    next(e);
+    if (isDuplicateEntry(e)) {
+      return res.status(409).json({
+        code: 'DuplicateCountry',
+        message: 'Country code already exists.',
+      });
+    }
+    return next(e);
   }
 });
 
@@ -177,9 +250,12 @@ locationAdmin.delete('/countries/:id', async (req, res, next) => {
  */
 locationAdmin.get('/countries/all', async (req, res, next) => {
   try {
-    const [items] = await pool.query<RowDataPacket[]>(
-      "SELECT id, name FROM countries WHERE status = 'active' ORDER BY name ASC"
-    );
+    const includeInactive =
+      ['1', 'true', 'yes'].includes(String(req.query.includeInactive ?? '').toLowerCase()) || false;
+    const sql = includeInactive
+      ? 'SELECT id, name, status FROM countries ORDER BY name ASC'
+      : "SELECT id, name, status FROM countries WHERE status = 'active' ORDER BY name ASC";
+    const [items] = await pool.query<RowDataPacket[]>(sql);
     res.json({ items });
   } catch (e) {
     next(e);
@@ -196,9 +272,25 @@ locationAdmin.post('/states', async (req, res, next) => {
   try {
     const { name, country_id, status } = CreateState.parse(req.body);
 
+    const [countryRows] = await pool.query<RowDataPacket[]>(
+      'SELECT name, status FROM countries WHERE id = ? LIMIT 1',
+      [country_id]
+    );
+    const country = countryRows[0];
+    if (!country)
+      return res.status(404).json({ code: 'ParentNotFound', message: 'Country not found' });
+    if (status === 'active' && country.status !== 'active') {
+      return res.status(400).json({
+        code: 'ParentInactive',
+        message: 'Cannot activate state because the parent country is inactive.',
+      });
+    }
+
+    const statusEffective = status === 'active' && country.status === 'active' ? 'active' : 'inactive';
+
     const [result] = await pool.query<ResultSetHeader>(
-      'INSERT INTO states (name, country_id, status) VALUES (?, ?, ?)',
-      [name, country_id, status]
+      'INSERT INTO states (name, country_id, status, status_effective) VALUES (?, ?, ?, ?)',
+      [name, country_id, status, statusEffective]
     );
 
     res.status(201).json({
@@ -206,8 +298,18 @@ locationAdmin.post('/states', async (req, res, next) => {
       name,
       country_id,
       status,
+      status_effective: statusEffective,
+      country_name: country.name,
+      country_status: country.status,
+      country_status_effective: country.status,
     });
   } catch (e) {
+    if (isDuplicateEntry(e)) {
+      return res.status(409).json({
+        code: 'DuplicateState',
+        message: 'State name already exists for this country.',
+      });
+    }
     next(e);
   }
 });
@@ -246,8 +348,16 @@ locationAdmin.get('/states', async (req, res, next) => {
     params.push(limit, offset);
     const [items] = await pool.query<RowDataPacket[]>(
       `SELECT
-         s.id, s.name, s.status, s.created_at, s.updated_at,
-         c.id as country_id, c.name as country_name
+         s.id,
+         s.name,
+         s.status,
+         s.status_effective,
+         s.created_at,
+         s.updated_at,
+         c.id AS country_id,
+         c.name AS country_name,
+         c.status AS country_status,
+         c.status AS country_status_effective
        ${baseQuery}
        ${whereSql}
        ORDER BY s.name ASC
@@ -280,6 +390,34 @@ locationAdmin.post('/states/:id', async (req, res, next) => {
       });
     }
 
+    const [existingRows] = await pool.query<RowDataPacket[]>(
+      `SELECT id, country_id, status FROM states WHERE id = ? LIMIT 1`,
+      [stateId]
+    );
+    const existing = existingRows[0];
+    if (!existing) {
+      return res.status(404).json({ code: 'NotFound', message: 'State not found' });
+    }
+
+    const targetCountryId = body.country_id ?? Number(existing.country_id);
+    const targetStatus = body.status ?? existing.status;
+
+    const [countryRows] = await pool.query<RowDataPacket[]>(
+      `SELECT id, name, status FROM countries WHERE id = ? LIMIT 1`,
+      [targetCountryId]
+    );
+    const country = countryRows[0];
+    if (!country) {
+      return res.status(404).json({ code: 'ParentNotFound', message: 'Country not found' });
+    }
+
+    if (targetStatus === 'active' && country.status !== 'active') {
+      return res.status(400).json({
+        code: 'ParentInactive',
+        message: 'Cannot activate state because the parent country is inactive.',
+      });
+    }
+
     const fields: string[] = [];
     const values: (string | number)[] = [];
     for (const [key, value] of Object.entries(body)) {
@@ -288,6 +426,9 @@ locationAdmin.post('/states/:id', async (req, res, next) => {
         values.push(value);
       }
     }
+    const stateEffective = targetStatus === 'active' && country.status === 'active' ? 'active' : 'inactive';
+    fields.push('status_effective = ?');
+    values.push(stateEffective);
     values.push(stateId);
 
     const [result] = await pool.query<ResultSetHeader>(
@@ -299,12 +440,41 @@ locationAdmin.post('/states/:id', async (req, res, next) => {
       return res.status(404).json({ code: 'NotFound', message: 'State not found' });
     }
 
+    if (stateEffective === 'inactive') {
+      await pool.query(`UPDATE cities SET status_effective = 'inactive' WHERE state_id = ?`, [stateId]);
+    } else {
+      await pool.query(
+        `UPDATE cities
+            SET status_effective = CASE WHEN status = 'active' THEN 'active' ELSE 'inactive' END
+          WHERE state_id = ?`,
+        [stateId]
+      );
+    }
+
     // Return the updated record
-    const [rows] = await pool.query<RowDataPacket[]>('SELECT * FROM states WHERE id = ?', [
-      stateId,
-    ]);
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `SELECT
+         s.id,
+         s.name,
+         s.status,
+         s.status_effective,
+         s.country_id,
+         c.name AS country_name,
+         c.status AS country_status,
+         c.status AS country_status_effective
+       FROM states s
+       JOIN countries c ON c.id = s.country_id
+      WHERE s.id = ?`,
+      [stateId]
+    );
     res.json(rows[0]);
   } catch (e) {
+    if (isDuplicateEntry(e)) {
+      return res.status(409).json({
+        code: 'DuplicateState',
+        message: 'State name already exists for this country.',
+      });
+    }
     next(e);
   }
 });
@@ -345,7 +515,7 @@ locationAdmin.delete('/states/:id', async (req, res, next) => {
 locationAdmin.get('/states/all', async (req, res, next) => {
   try {
     const [items] = await pool.query<RowDataPacket[]>(
-      "SELECT id, name FROM states WHERE status = 'active' ORDER BY name ASC"
+      "SELECT id, name, status, status_effective FROM states WHERE status_effective = 'active' ORDER BY name ASC"
     );
     res.json({ items });
   } catch (e) {
@@ -363,9 +533,41 @@ locationAdmin.post('/cities', async (req, res, next) => {
   try {
     const { name, state_id, status } = CreateCity.parse(req.body);
 
+    const [stateRows] = await pool.query<RowDataPacket[]>(
+      `SELECT
+         s.id,
+         s.name,
+         s.status,
+         s.status_effective,
+         c.id AS country_id,
+         c.name AS country_name,
+         c.status AS country_status
+         FROM states s
+         JOIN countries c ON c.id = s.country_id
+        WHERE s.id = ? LIMIT 1`,
+      [state_id]
+    );
+    const parentState = stateRows[0];
+    if (!parentState)
+      return res.status(404).json({ code: 'ParentNotFound', message: 'State not found' });
+    if (
+      status === 'active' &&
+      (parentState.status !== 'active' || parentState.country_status !== 'active')
+    ) {
+      return res.status(400).json({
+        code: 'ParentInactive',
+        message: 'Cannot activate city because the parent state or country is inactive.',
+      });
+    }
+
+    const parentStateEffective =
+      parentState.status_effective ??
+      (parentState.status === 'active' && parentState.country_status === 'active' ? 'active' : 'inactive');
+    const statusEffective = status === 'active' && parentStateEffective === 'active' ? 'active' : 'inactive';
+
     const [result] = await pool.query<ResultSetHeader>(
-      'INSERT INTO cities (name, state_id, status) VALUES (?, ?, ?)',
-      [name, state_id, status]
+      'INSERT INTO cities (name, state_id, status, status_effective) VALUES (?, ?, ?, ?)',
+      [name, state_id, status, statusEffective]
     );
 
     res.status(201).json({
@@ -373,8 +575,22 @@ locationAdmin.post('/cities', async (req, res, next) => {
       name,
       state_id,
       status,
+      status_effective: statusEffective,
+      state_name: parentState.name,
+      state_status: parentState.status,
+      state_status_effective: parentStateEffective,
+      country_id: parentState.country_id,
+      country_name: parentState.country_name,
+      country_status: parentState.country_status,
+      country_status_effective: parentState.country_status,
     });
   } catch (e) {
+    if (isDuplicateEntry(e)) {
+      return res.status(409).json({
+        code: 'DuplicateCity',
+        message: 'City name already exists for this state.',
+      });
+    }
     next(e);
   }
 });
@@ -417,9 +633,19 @@ locationAdmin.get('/cities', async (req, res, next) => {
     params.push(limit, offset);
     const [items] = await pool.query<RowDataPacket[]>(
       `SELECT
-         ci.id, ci.name, ci.status, ci.created_at,
-         s.id as state_id, s.name as state_name,
-         co.id as country_id, co.name as country_name
+         ci.id,
+         ci.name,
+         ci.status,
+         ci.status_effective,
+         ci.created_at,
+         s.id AS state_id,
+         s.name AS state_name,
+         s.status AS state_status,
+         s.status_effective AS state_status_effective,
+         co.id AS country_id,
+         co.name AS country_name,
+         co.status AS country_status,
+         co.status AS country_status_effective
        ${baseQuery}
        ${whereSql}
        ORDER BY ci.name ASC
@@ -452,6 +678,48 @@ locationAdmin.post('/cities/:id', async (req, res, next) => {
       });
     }
 
+    const [existingRows] = await pool.query<RowDataPacket[]>(
+      `SELECT id, state_id, status FROM cities WHERE id = ? LIMIT 1`,
+      [cityId]
+    );
+    const existing = existingRows[0];
+    if (!existing) return res.status(404).json({ code: 'NotFound', message: 'City not found' });
+
+    const targetStateId = body.state_id ?? Number(existing.state_id);
+    const targetStatus = body.status ?? existing.status;
+
+    const [stateRows] = await pool.query<RowDataPacket[]>(
+      `SELECT
+         s.id,
+         s.name,
+         s.status,
+         s.status_effective,
+         c.id AS country_id,
+         c.name AS country_name,
+         c.status AS country_status
+         FROM states s
+         JOIN countries c ON c.id = s.country_id
+        WHERE s.id = ? LIMIT 1`,
+      [targetStateId]
+    );
+    const parentState = stateRows[0];
+    if (!parentState)
+      return res.status(404).json({ code: 'ParentNotFound', message: 'State not found' });
+    if (
+      targetStatus === 'active' &&
+      (parentState.status !== 'active' || parentState.country_status !== 'active')
+    ) {
+      return res.status(400).json({
+        code: 'ParentInactive',
+        message: 'Cannot activate city because the parent state or country is inactive.',
+      });
+    }
+
+    const parentStateEffective =
+      parentState.status_effective ??
+      (parentState.status === 'active' && parentState.country_status === 'active' ? 'active' : 'inactive');
+    const cityEffective = targetStatus === 'active' && parentStateEffective === 'active' ? 'active' : 'inactive';
+
     const fields: string[] = [];
     const values: (string | number)[] = [];
     for (const [key, value] of Object.entries(body)) {
@@ -460,6 +728,8 @@ locationAdmin.post('/cities/:id', async (req, res, next) => {
         values.push(value);
       }
     }
+    fields.push('status_effective = ?');
+    values.push(cityEffective);
     values.push(cityId);
 
     const [result] = await pool.query<ResultSetHeader>(
@@ -472,9 +742,34 @@ locationAdmin.post('/cities/:id', async (req, res, next) => {
     }
 
     // Return the updated record
-    const [rows] = await pool.query<RowDataPacket[]>('SELECT * FROM cities WHERE id = ?', [cityId]);
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `SELECT
+         ci.id,
+         ci.name,
+         ci.status,
+         ci.status_effective,
+         ci.state_id,
+         s.name AS state_name,
+         s.status AS state_status,
+         s.status_effective AS state_status_effective,
+         co.id AS country_id,
+         co.name AS country_name,
+         co.status AS country_status,
+         co.status AS country_status_effective
+       FROM cities ci
+       JOIN states s ON s.id = ci.state_id
+       JOIN countries co ON co.id = s.country_id
+      WHERE ci.id = ?`,
+      [cityId]
+    );
     res.json(rows[0]);
   } catch (e) {
+    if (isDuplicateEntry(e)) {
+      return res.status(409).json({
+        code: 'DuplicateCity',
+        message: 'City name already exists for this state.',
+      });
+    }
     next(e);
   }
 });
@@ -548,6 +843,12 @@ locationAdmin.post('/countries/import', uploadJson.single('file'), async (req, r
       affectedRows: result.affectedRows,
     });
   } catch (e) {
+    if (isDuplicateEntry(e)) {
+      return res.status(409).json({
+        code: 'DuplicateCountry',
+        message: 'Country code already exists.',
+      });
+    }
     next(e);
   }
 });
@@ -604,7 +905,9 @@ locationAdmin.post('/states/import', uploadJson.single('file'), async (req, res,
     const values = rows.map((row) => {
       const countryId = countryMap.get(row.country_code);
       if (!countryId) {
-        throw new Error(`Invalid country_code: ${row.country_code}`);
+        const err = new Error(`Invalid country_code: ${row.country_code}`);
+        Object.assign(err, { status: 400, code: 'InvalidReference' });
+        throw err;
       }
       return [row.name, countryId, row.status];
     });
@@ -621,6 +924,12 @@ locationAdmin.post('/states/import', uploadJson.single('file'), async (req, res,
     });
   } catch (e) {
     await conn.rollback();
+    if (isDuplicateEntry(e)) {
+      return res.status(409).json({
+        code: 'DuplicateState',
+        message: 'State name already exists for this country.',
+      });
+    }
     next(e);
   } finally {
     conn.release();
@@ -683,7 +992,11 @@ locationAdmin.post('/cities/import', uploadJson.single('file'), async (req, res,
     const values = rows.map((row) => {
       const stateId = stateMap.get(`${row.state_name}|${row.country_code}`);
       if (!stateId) {
-        throw new Error(`Invalid combo: state=${row.state_name}, country=${row.country_code}`);
+        const err = new Error(
+          `Invalid combo: state=${row.state_name}, country=${row.country_code}`
+        );
+        Object.assign(err, { status: 400, code: 'InvalidReference' });
+        throw err;
       }
       return [row.name, stateId, row.status];
     });
@@ -700,6 +1013,12 @@ locationAdmin.post('/cities/import', uploadJson.single('file'), async (req, res,
     });
   } catch (e) {
     await conn.rollback();
+    if (isDuplicateEntry(e)) {
+      return res.status(409).json({
+        code: 'DuplicateCity',
+        message: 'City name already exists for this state.',
+      });
+    }
     next(e);
   } finally {
     conn.release();

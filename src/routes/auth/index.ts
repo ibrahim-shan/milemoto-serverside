@@ -25,7 +25,7 @@ auth.use((req, res, next) => {
     } catch {}
   }
   if ((!origin && !referer) || allowByOrigin || allowByReferer) return next();
-  return res.status(43).json({ error: 'CSRF blocked' });
+  return res.status(403).json({ error: 'CSRF blocked' });
 });
 
 // Assemble all the sub-routers

@@ -110,8 +110,10 @@ passwordAuth.post('/verify-email/resend', async (req, res, next) => {
     }
     res.json({ ok: true } as OkResponseDto);
   } catch (e) {
+    if (e instanceof z.ZodError) {
+      return res.status(400).json({ error: 'Invalid request' });
+    }
     next(e);
-    return res.status(400).json({ error: 'Invalid request' });
   }
 });
 
@@ -151,8 +153,10 @@ passwordAuth.post('/forgot', async (req, res, next) => {
     }
     res.json({ ok: true } as OkResponseDto);
   } catch (e) {
+    if (e instanceof z.ZodError) {
+      return res.status(400).json({ error: 'Invalid request' });
+    }
     next(e);
-    return res.status(400).json({ error: 'Invalid request' });
   }
 });
 
@@ -188,7 +192,9 @@ passwordAuth.post('/reset', async (req, res, next) => {
     await revokeAllTrustedDevices(String(r.user_id));
     res.json({ ok: true } as OkResponseDto);
   } catch (e) {
+    if (e instanceof z.ZodError) {
+      return res.status(400).json({ error: 'Invalid request' });
+    }
     next(e);
-    return res.status(400).json({ error: 'Invalid request' });
   }
 });

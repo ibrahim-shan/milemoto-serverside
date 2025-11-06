@@ -17,7 +17,7 @@ import {
   ttlForRole,
   setRefreshCookie,
 } from './auth.helpers.js';
-import { sha256 } from '../../../src/utils/crypto.js';
+import { sha256 } from '../../utils/crypto.js';
 import { dbNow } from '../../db/time.js';
 
 export const oauthAuth = Router();
