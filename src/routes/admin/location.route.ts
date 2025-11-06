@@ -23,7 +23,10 @@ locationAdmin.use(requireAuth, requireRole('admin'));
 
 function isDuplicateEntry(error: unknown): error is { code: string } {
   return Boolean(
-    error && typeof error === 'object' && 'code' in error && (error as { code?: string }).code === 'ER_DUP_ENTRY'
+    error &&
+      typeof error === 'object' &&
+      'code' in error &&
+      (error as { code?: string }).code === 'ER_DUP_ENTRY'
   );
 }
 
@@ -139,10 +142,10 @@ locationAdmin.post('/countries/:id', async (req, res, next) => {
       }
       values.push(countryId);
 
-    const [result] = await conn.query<ResultSetHeader>(
-      `UPDATE countries SET ${fields.join(', ')} WHERE id = ?`,
-      values
-    );
+      const [result] = await conn.query<ResultSetHeader>(
+        `UPDATE countries SET ${fields.join(', ')} WHERE id = ?`,
+        values
+      );
 
       if (result.affectedRows === 0) {
         await conn.rollback();
@@ -286,7 +289,8 @@ locationAdmin.post('/states', async (req, res, next) => {
       });
     }
 
-    const statusEffective = status === 'active' && country.status === 'active' ? 'active' : 'inactive';
+    const statusEffective =
+      status === 'active' && country.status === 'active' ? 'active' : 'inactive';
 
     const [result] = await pool.query<ResultSetHeader>(
       'INSERT INTO states (name, country_id, status, status_effective) VALUES (?, ?, ?, ?)',
@@ -426,7 +430,8 @@ locationAdmin.post('/states/:id', async (req, res, next) => {
         values.push(value);
       }
     }
-    const stateEffective = targetStatus === 'active' && country.status === 'active' ? 'active' : 'inactive';
+    const stateEffective =
+      targetStatus === 'active' && country.status === 'active' ? 'active' : 'inactive';
     fields.push('status_effective = ?');
     values.push(stateEffective);
     values.push(stateId);
@@ -441,7 +446,9 @@ locationAdmin.post('/states/:id', async (req, res, next) => {
     }
 
     if (stateEffective === 'inactive') {
-      await pool.query(`UPDATE cities SET status_effective = 'inactive' WHERE state_id = ?`, [stateId]);
+      await pool.query(`UPDATE cities SET status_effective = 'inactive' WHERE state_id = ?`, [
+        stateId,
+      ]);
     } else {
       await pool.query(
         `UPDATE cities
@@ -562,8 +569,11 @@ locationAdmin.post('/cities', async (req, res, next) => {
 
     const parentStateEffective =
       parentState.status_effective ??
-      (parentState.status === 'active' && parentState.country_status === 'active' ? 'active' : 'inactive');
-    const statusEffective = status === 'active' && parentStateEffective === 'active' ? 'active' : 'inactive';
+      (parentState.status === 'active' && parentState.country_status === 'active'
+        ? 'active'
+        : 'inactive');
+    const statusEffective =
+      status === 'active' && parentStateEffective === 'active' ? 'active' : 'inactive';
 
     const [result] = await pool.query<ResultSetHeader>(
       'INSERT INTO cities (name, state_id, status, status_effective) VALUES (?, ?, ?, ?)',
@@ -717,8 +727,11 @@ locationAdmin.post('/cities/:id', async (req, res, next) => {
 
     const parentStateEffective =
       parentState.status_effective ??
-      (parentState.status === 'active' && parentState.country_status === 'active' ? 'active' : 'inactive');
-    const cityEffective = targetStatus === 'active' && parentStateEffective === 'active' ? 'active' : 'inactive';
+      (parentState.status === 'active' && parentState.country_status === 'active'
+        ? 'active'
+        : 'inactive');
+    const cityEffective =
+      targetStatus === 'active' && parentStateEffective === 'active' ? 'active' : 'inactive';
 
     const fields: string[] = [];
     const values: (string | number)[] = [];
